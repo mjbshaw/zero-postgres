@@ -30,7 +30,12 @@ pub struct Conn {
     backend_key: Option<BackendKeyData>,
     server_params: Vec<(String, String)>,
     pub(crate) transaction_status: TransactionStatus,
+    // Permanent failures are sticky; completing an exchange never clears them.
     pub(crate) is_broken: bool,
+    exchange_in_progress: bool,
+    // A pipeline or unnamed portal still owes protocol completion. Kept here
+    // so forgetting its handle/future cannot make the connection reusable.
+    pub(crate) scope_pending: bool,
     name_counter: u64,
     async_message_handler: AsyncMessageHandlerBox,
 }
@@ -135,6 +140,8 @@ impl Conn {
             server_params: state_machine.take_server_params(),
             transaction_status: state_machine.transaction_status(),
             is_broken: false,
+            exchange_in_progress: false,
+            scope_pending: false,
             name_counter: 0,
             async_message_handler: None,
         };
@@ -227,9 +234,48 @@ impl Conn {
         self.transaction_status.in_transaction()
     }
 
-    /// Check if the connection is broken.
+    /// Returns whether the connection is marked unusable.
+    ///
+    /// An interrupted exchange (including cancellation or a handler error/panic
+    /// before completion), or an abandoned pipeline or unnamed portal that still
+    /// owes protocol completion, prevents reuse. Dropping an unpolled query
+    /// future does not affect the connection.
+    ///
+    /// This does not probe the peer: `false` does not guarantee it is alive.
     pub fn is_broken(&self) -> bool {
-        self.is_broken
+        self.is_broken || self.exchange_in_progress || self.scope_pending
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
+        if self.is_broken() {
+            return Err(Error::ConnectionBroken);
+        }
+        Ok(())
+    }
+
+    // Only the existing pipeline/portal may continue a pending scope. Public
+    // Conn entry points must additionally use ensure_usable before calling
+    // drivers that allow such continuation.
+    pub(crate) fn ensure_exchange_ready(&self) -> Result<()> {
+        if self.is_broken || self.exchange_in_progress {
+            return Err(Error::ConnectionBroken);
+        }
+        Ok(())
+    }
+
+    // Record an exchange before its first I/O. Cancellation, errors and panics
+    // leave this set even if the future's destructor never runs.
+    pub(crate) fn begin_exchange(&mut self) -> Result<()> {
+        self.ensure_exchange_ready()?;
+        self.exchange_in_progress = true;
+        Ok(())
+    }
+
+    // Call only after this exchange reaches a boundary permitting continuation:
+    // a complete pipeline write, or the driver's expected terminal response.
+    // This does not clear permanent failures or the enclosing scope's pending Sync.
+    pub(crate) fn finish_exchange(&mut self) {
+        self.exchange_in_progress = false;
     }
 
     /// Generate the next unique portal name.
@@ -247,6 +293,7 @@ impl Conn {
         statement: &S,
         params: &P,
     ) -> Result<()> {
+        self.ensure_usable()?;
         // Create bind state machine for named portal
         let mut state_machine = match statement.statement_ref() {
             StatementRef::Sql(sql) => {
@@ -262,6 +309,7 @@ impl Conn {
         };
 
         // Drive the state machine to completion (ParseComplete + BindComplete)
+        self.begin_exchange()?;
         loop {
             match state_machine.step(&mut self.buffer_set)? {
                 Action::ReadMessage => {
@@ -282,7 +330,10 @@ impl Conn {
                     self.stream.flush().await?;
                     self.stream.read_message(&mut self.buffer_set).await?;
                 }
-                Action::Finished => break,
+                Action::Finished => {
+                    self.finish_exchange();
+                    break;
+                }
                 _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
             }
         }
@@ -316,6 +367,7 @@ impl Conn {
 
     /// Drive a state machine to completion.
     async fn drive<S: StateMachine>(&mut self, state_machine: &mut S) -> Result<()> {
+        self.begin_exchange()?;
         loop {
             match state_machine.step(&mut self.buffer_set)? {
                 Action::WriteAndReadByte => {
@@ -355,9 +407,11 @@ impl Conn {
                 }
                 Action::Error(server_error) => {
                     self.transaction_status = state_machine.transaction_status();
+                    self.finish_exchange();
                     return Err(Error::Server(server_error));
                 }
                 Action::Finished => {
+                    self.finish_exchange();
                     self.transaction_status = state_machine.transaction_status();
                     break;
                 }
@@ -368,6 +422,7 @@ impl Conn {
 
     /// Execute a simple query with a handler.
     pub async fn query<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.query_inner(sql, handler).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -425,6 +480,7 @@ impl Conn {
 
     /// Close the connection gracefully.
     pub async fn close(mut self) -> Result<()> {
+        self.ensure_usable()?;
         self.buffer_set.write_buffer.clear();
         write_terminate(&mut self.buffer_set.write_buffer);
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
@@ -448,6 +504,7 @@ impl Conn {
         query: &str,
         param_oids: &[u32],
     ) -> Result<PreparedStatement> {
+        self.ensure_usable()?;
         self.name_counter += 1;
         let idx = self.name_counter;
         let result = self.prepare_inner(idx, query, param_oids).await;
@@ -461,6 +518,7 @@ impl Conn {
 
     /// Prepare multiple statements in a single round-trip.
     pub async fn prepare_batch(&mut self, queries: &[&str]) -> Result<Vec<PreparedStatement>> {
+        self.ensure_usable()?;
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -487,6 +545,7 @@ impl Conn {
         let mut state_machine =
             BatchPrepareStateMachine::new(&mut self.buffer_set, queries, start_idx);
 
+        self.begin_exchange()?;
         loop {
             match state_machine.step(&mut self.buffer_set)? {
                 Action::ReadMessage => {
@@ -501,6 +560,7 @@ impl Conn {
                     self.stream.read_message(&mut self.buffer_set).await?;
                 }
                 Action::Finished => {
+                    self.finish_exchange();
                     self.transaction_status = state_machine.transaction_status();
                     break;
                 }
@@ -542,6 +602,7 @@ impl Conn {
         params: P,
         handler: &mut H,
     ) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.exec_inner(&statement, &params, handler).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -647,6 +708,7 @@ impl Conn {
         params_list: &[P],
         chunk_size: usize,
     ) -> Result<()> {
+        self.ensure_usable()?;
         let result = self
             .exec_batch_inner(&statement, params_list, chunk_size)
             .await;
@@ -724,6 +786,7 @@ impl Conn {
     ) -> Result<()> {
         use crate::state::action::Action;
 
+        self.begin_exchange()?;
         loop {
             let step_result = state_machine.step(&mut self.buffer_set);
             match step_result {
@@ -739,10 +802,12 @@ impl Conn {
                     self.stream.read_message(&mut self.buffer_set).await?;
                 }
                 Ok(Action::Finished) => {
+                    self.finish_exchange();
                     break;
                 }
                 Ok(Action::Error(server_error)) => {
                     self.transaction_status = state_machine.transaction_status();
+                    self.finish_exchange();
                     return Err(Error::Server(server_error));
                 }
                 Ok(_) => return Err(Error::LibraryBug("Unexpected action in batch".into())),
@@ -754,6 +819,7 @@ impl Conn {
 
     /// Close a prepared statement.
     pub async fn close_statement(&mut self, stmt: &PreparedStatement) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.close_statement_inner(&stmt.wire_name()).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -774,21 +840,25 @@ impl Conn {
 
     /// Low-level flush: send FLUSH to force server to send pending responses.
     pub async fn lowlevel_flush(&mut self) -> Result<()> {
+        self.ensure_usable()?;
         use crate::protocol::frontend::write_flush;
 
         self.buffer_set.write_buffer.clear();
         write_flush(&mut self.buffer_set.write_buffer);
 
+        self.begin_exchange()?;
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
         let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
         self.buffer_set.write_buffer = buf;
         result?;
         self.stream.flush().await?;
+        self.finish_exchange();
         Ok(())
     }
 
     /// Low-level sync: send SYNC and receive ReadyForQuery.
     pub async fn lowlevel_sync(&mut self) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.sync_inner().await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -805,6 +875,7 @@ impl Conn {
         self.buffer_set.write_buffer.clear();
         write_sync(&mut self.buffer_set.write_buffer);
 
+        self.begin_exchange()?;
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
         let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
         self.buffer_set.write_buffer = buf;
@@ -825,14 +896,19 @@ impl Conn {
                 msg_type::READY_FOR_QUERY => {
                     let ready = ReadyForQuery::parse(&self.buffer_set.read_buffer)?;
                     self.transaction_status = ready.transaction_status().unwrap_or_default();
+                    self.finish_exchange();
                     if let Some(e) = pending_error {
                         return Err(e);
                     }
                     return Ok(());
                 }
                 msg_type::ERROR_RESPONSE => {
-                    let error = ErrorResponse::parse(&self.buffer_set.read_buffer)?;
-                    pending_error = Some(error.into_error());
+                    let error = ErrorResponse::parse(&self.buffer_set.read_buffer)?.into_error();
+                    if error.is_connection_broken() {
+                        self.is_broken = true;
+                        return Err(error);
+                    }
+                    pending_error = Some(error);
                 }
                 _ => {
                     // Ignore other messages before ReadyForQuery
@@ -848,6 +924,7 @@ impl Conn {
         statement_name: &str,
         params: P,
     ) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.bind_inner(portal, statement_name, &params).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -877,6 +954,7 @@ impl Conn {
         )?;
         write_flush(&mut self.buffer_set.write_buffer);
 
+        self.begin_exchange()?;
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
         let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
         self.buffer_set.write_buffer = buf;
@@ -894,6 +972,7 @@ impl Conn {
             match type_byte {
                 msg_type::BIND_COMPLETE => {
                     BindComplete::parse(&self.buffer_set.read_buffer)?;
+                    self.finish_exchange();
                     return Ok(());
                 }
                 msg_type::ERROR_RESPONSE => {
@@ -917,6 +996,7 @@ impl Conn {
         max_rows: u32,
         handler: &mut H,
     ) -> Result<bool> {
+        self.ensure_usable()?;
         let result = self.execute_portal_inner(portal, max_rows, handler).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -943,6 +1023,7 @@ impl Conn {
         write_execute(&mut self.buffer_set.write_buffer, portal, max_rows);
         write_flush(&mut self.buffer_set.write_buffer);
 
+        self.begin_exchange()?;
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
         let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
         self.buffer_set.write_buffer = buf;
@@ -977,10 +1058,12 @@ impl Conn {
                 msg_type::COMMAND_COMPLETE => {
                     let complete = CommandComplete::parse(&self.buffer_set.read_buffer)?;
                     handler.result_end(complete)?;
+                    self.finish_exchange();
                     return Ok(false); // No more rows
                 }
                 msg_type::PORTAL_SUSPENDED => {
                     PortalSuspended::parse(&self.buffer_set.read_buffer)?;
+                    self.finish_exchange();
                     return Ok(true); // More rows available
                 }
                 msg_type::ERROR_RESPONSE => {
@@ -997,7 +1080,11 @@ impl Conn {
         }
     }
 
-    /// Execute a statement with iterative row fetching using a portal.
+    /// Execute a statement with iterative row fetching using an unnamed portal.
+    ///
+    /// After the closure returns, Sync ends the implicit transaction if the
+    /// connection can still complete the exchange. Cancellation or a panic
+    /// before that completion makes the connection unusable.
     pub async fn exec_portal<S: IntoStatement, P, F, T>(
         &mut self,
         statement: S,
@@ -1008,6 +1095,7 @@ impl Conn {
         P: ToParams,
         F: AsyncFnOnce(&mut super::unnamed_portal::UnnamedPortal<'_>) -> Result<T>,
     {
+        self.ensure_usable()?;
         let result = self.exec_portal_inner(&statement, &params, f).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -1042,6 +1130,8 @@ impl Conn {
         };
 
         // Drive the state machine to completion (ParseComplete + BindComplete)
+        self.scope_pending = true;
+        self.begin_exchange()?;
         loop {
             match state_machine.step(&mut self.buffer_set)? {
                 Action::ReadMessage => {
@@ -1062,7 +1152,10 @@ impl Conn {
                     self.stream.flush().await?;
                     self.stream.read_message(&mut self.buffer_set).await?;
                 }
-                Action::Finished => break,
+                Action::Finished => {
+                    self.finish_exchange();
+                    break;
+                }
                 _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
             }
         }
@@ -1071,8 +1164,14 @@ impl Conn {
         let mut portal = super::unnamed_portal::UnnamedPortal { conn: self };
         let result = f(&mut portal).await;
 
-        // Always sync to end implicit transaction (even on error)
+        // Attempt Sync after the closure returns. An interrupted exchange
+        // rejects this attempt and keeps the enclosing scope unusable.
         let sync_result = portal.conn.sync_inner().await;
+
+        // A recoverable server error may also complete at ReadyForQuery.
+        if portal.conn.ensure_exchange_ready().is_ok() {
+            portal.conn.scope_pending = false;
+        }
 
         // Return closure result, or sync error if closure succeeded but sync failed
         match (result, sync_result) {
@@ -1084,6 +1183,7 @@ impl Conn {
 
     /// Low-level close portal: send Close(Portal) and receive CloseComplete.
     pub async fn lowlevel_close_portal(&mut self, portal: &str) -> Result<()> {
+        self.ensure_usable()?;
         let result = self.close_portal_inner(portal).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -1101,6 +1201,7 @@ impl Conn {
         write_close_portal(&mut self.buffer_set.write_buffer, portal);
         write_flush(&mut self.buffer_set.write_buffer);
 
+        self.begin_exchange()?;
         let buf = std::mem::take(&mut self.buffer_set.write_buffer);
         let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
         self.buffer_set.write_buffer = buf;
@@ -1118,6 +1219,7 @@ impl Conn {
             match type_byte {
                 msg_type::CLOSE_COMPLETE => {
                     CloseComplete::parse(&self.buffer_set.read_buffer)?;
+                    self.finish_exchange();
                     return Ok(());
                 }
                 msg_type::ERROR_RESPONSE => {
@@ -1139,6 +1241,7 @@ impl Conn {
     where
         F: AsyncFnOnce(&mut super::pipeline::Pipeline<'_>) -> Result<T>,
     {
+        self.ensure_usable()?;
         let mut pipeline = super::pipeline::Pipeline::new_inner(self);
         let result = f(&mut pipeline).await;
         pipeline.cleanup().await;

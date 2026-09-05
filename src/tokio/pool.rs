@@ -101,3 +101,7 @@ impl Drop for PooledConn {
         });
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "cancellation_tests.rs"]
+mod cancellation_tests;

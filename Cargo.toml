@@ -67,7 +67,7 @@ diesel = { version = "2", features = [
 ], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 tokio-postgres = "0.7"
 postgres = "0.19"
 [[example]]

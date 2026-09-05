@@ -88,3 +88,7 @@ impl Drop for PooledConn {
         .detach();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "cancellation_tests.rs"]
+mod cancellation_tests;

@@ -23,7 +23,8 @@ use super::conn::Conn;
 
 /// Async pipeline mode for batching multiple queries.
 ///
-/// Created by [`Conn::pipeline`].
+/// Created by [`Conn::pipeline`]. Dropping or forgetting this handle with
+/// protocol completion still pending makes the connection unusable.
 pub struct Pipeline<'a> {
     conn: &'a mut Conn,
     /// Monotonically increasing counter for queued operations
@@ -38,11 +39,22 @@ pub struct Pipeline<'a> {
     expectations: VecDeque<Expectation>,
 }
 
+// scope_pending already prevents reuse if this destructor is skipped. A normal
+// drop additionally records abandonment as a permanent failure.
+impl Drop for Pipeline<'_> {
+    fn drop(&mut self) {
+        if self.conn.scope_pending {
+            self.conn.is_broken = true;
+        }
+    }
+}
+
 impl<'a> Pipeline<'a> {
     /// Create a new pipeline.
     ///
     /// Prefer using [`Conn::pipeline`] which handles cleanup automatically.
-    /// This constructor is available for advanced use cases.
+    /// This constructor is available for advanced use cases. Operations reject
+    /// connections left unusable by a previous exchange or abandoned scope.
     #[cfg(feature = "lowlevel")]
     pub fn new(conn: &'a mut Conn) -> Self {
         Self::new_inner(conn)
@@ -50,7 +62,13 @@ impl<'a> Pipeline<'a> {
 
     /// Create a new pipeline (internal).
     pub(crate) fn new_inner(conn: &'a mut Conn) -> Self {
-        conn.buffer_set.write_buffer.clear();
+        if conn.ensure_usable().is_err() {
+            // A fresh handle cannot recover expectations owned by an abandoned
+            // pipeline or portal. Keep this failure sticky even in lowlevel use.
+            conn.is_broken = true;
+        } else {
+            conn.buffer_set.write_buffer.clear();
+        }
         Self {
             conn,
             queue_seq: 0,
@@ -73,47 +91,66 @@ impl<'a> Pipeline<'a> {
     }
 
     async fn cleanup_inner(&mut self) {
-        // Nothing to clean up if no operations were queued and no expectations pending
-        if self.queue_seq == 0 && self.expectations.is_empty() {
+        if self.conn.ensure_exchange_ready().is_err() {
             return;
         }
-
-        // Send sync if we have unflushed operations or no sync is queued yet
-        if !self.conn.buffer_set.write_buffer.is_empty()
-            || !self.expectations.iter().any(|e| *e == Expectation::Sync)
+        if self.expectations.is_empty() && !self.conn.scope_pending {
+            self.conn.buffer_set.write_buffer.clear();
+            return;
+        }
+        if (!self.conn.buffer_set.write_buffer.is_empty()
+            || !self.expectations.iter().any(|e| *e == Expectation::Sync))
+            && self.sync().await.is_err()
         {
-            let _ = self.sync().await;
+            return;
         }
-
-        // Drain remaining expectations
-        if self.aborted {
-            // In aborted state, server skipped remaining commands - only consume ReadyForQuery(s)
-            while let Some(expectation) = self.expectations.pop_front() {
-                if expectation == Expectation::Sync {
-                    let _ = self.consume_ready_for_query().await;
-                }
+        if self.conn.begin_exchange().is_err() {
+            return;
+        }
+        while let Some(expectation) = self.expectations.pop_front() {
+            if self.aborted && expectation != Expectation::Sync {
+                continue;
             }
-        } else {
-            // Normal drain: process all expectations
-            while let Some(expectation) = self.expectations.pop_front() {
-                let _ = self.drain_expectation(expectation).await;
+            let result = self.drain_expectation(expectation).await;
+            if result.is_err() && (!self.aborted || expectation == Expectation::Sync) {
+                return;
+            }
+            if expectation == Expectation::Sync {
+                self.aborted = false;
             }
         }
-
-        // Reset state
         self.queue_seq = 0;
         self.claim_seq = 0;
         self.aborted = false;
+        self.conn.finish_exchange();
     }
 
     /// Drain a single expectation.
-    async fn drain_expectation(&mut self, expectation: Expectation) {
-        let mut handler = crate::handler::DropHandler::new();
-        let _ = match expectation {
-            Expectation::ParseBindExecute => self.claim_parse_bind_exec_inner(&mut handler).await,
-            Expectation::BindExecute => self.claim_bind_exec_inner(&mut handler, None).await,
-            Expectation::Sync => self.consume_ready_for_query().await,
-        };
+    async fn drain_expectation(&mut self, expectation: Expectation) -> Result<()> {
+        if expectation == Expectation::Sync {
+            return self.consume_ready_for_query().await;
+        }
+        // Discard rows without decoding: prepared executions need not send a
+        // RowDescription, and an unclaimed ticket's cached columns are gone.
+        loop {
+            self.read_next_message().await?;
+            match self.conn.buffer_set.type_byte {
+                msg_type::COMMAND_COMPLETE => {
+                    CommandComplete::parse(&self.conn.buffer_set.read_buffer)?;
+                    return Ok(());
+                }
+                msg_type::EMPTY_QUERY_RESPONSE => {
+                    EmptyQueryResponse::parse(&self.conn.buffer_set.read_buffer)?;
+                    return Ok(());
+                }
+                msg_type::PARSE_COMPLETE
+                | msg_type::BIND_COMPLETE
+                | msg_type::ROW_DESCRIPTION
+                | msg_type::NO_DATA
+                | msg_type::DATA_ROW => {}
+                _ => return self.unexpected_message("pipeline execution response"),
+            }
+        }
     }
 
     // ========================================================================
@@ -126,6 +163,7 @@ impl<'a> Pipeline<'a> {
         statement: &'s (impl IntoStatement + ?Sized),
         params: P,
     ) -> Result<Ticket<'s>> {
+        self.conn.ensure_exchange_ready()?;
         let seq = self.queue_seq;
         self.queue_seq += 1;
 
@@ -171,7 +209,10 @@ impl<'a> Pipeline<'a> {
 
     /// Send a FLUSH message to trigger server response.
     pub async fn flush(&mut self) -> Result<()> {
+        self.conn.ensure_exchange_ready()?;
+        self.conn.begin_exchange()?;
         if !self.conn.buffer_set.write_buffer.is_empty() {
+            self.conn.scope_pending = true;
             write_flush(&mut self.conn.buffer_set.write_buffer);
             let buf = std::mem::take(&mut self.conn.buffer_set.write_buffer);
             let BufResult(result, buf) = self.conn.stream.write_all_owned(buf).await;
@@ -180,11 +221,13 @@ impl<'a> Pipeline<'a> {
             self.conn.stream.flush().await?;
             self.conn.buffer_set.write_buffer.clear();
         }
+        self.conn.finish_exchange();
         Ok(())
     }
 
     /// Send a SYNC message to establish a transaction boundary.
     pub async fn sync(&mut self) -> Result<()> {
+        self.conn.ensure_exchange_ready()?;
         let result = self.sync_inner().await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -195,6 +238,8 @@ impl<'a> Pipeline<'a> {
     }
 
     async fn sync_inner(&mut self) -> Result<()> {
+        self.conn.begin_exchange()?;
+        self.conn.scope_pending = true;
         write_sync(&mut self.conn.buffer_set.write_buffer);
         self.expectations.push_back(Expectation::Sync);
         let buf = std::mem::take(&mut self.conn.buffer_set.write_buffer);
@@ -203,6 +248,7 @@ impl<'a> Pipeline<'a> {
         result?;
         self.conn.stream.flush().await?;
         self.conn.buffer_set.write_buffer.clear();
+        self.conn.finish_exchange();
         Ok(())
     }
 
@@ -220,13 +266,17 @@ impl<'a> Pipeline<'a> {
             }
 
             if type_byte == msg_type::ERROR_RESPONSE {
-                let error = ErrorResponse::parse(&self.conn.buffer_set.read_buffer)?;
-                return Err(error.into_error());
+                let error = ErrorResponse::parse(&self.conn.buffer_set.read_buffer)?.into_error();
+                if error.is_connection_broken() {
+                    self.conn.is_broken = true;
+                }
+                return Err(error);
             }
 
             if type_byte == msg_type::READY_FOR_QUERY {
                 let ready = ReadyForQuery::parse(&self.conn.buffer_set.read_buffer)?;
                 self.conn.transaction_status = ready.transaction_status().unwrap_or_default();
+                self.conn.scope_pending = !self.expectations.is_empty();
                 return Ok(());
             }
         }
@@ -262,6 +312,7 @@ impl<'a> Pipeline<'a> {
         ticket: Ticket<'_>,
         handler: &mut H,
     ) -> Result<()> {
+        self.conn.ensure_exchange_ready()?;
         self.check_sequence(ticket.seq)?;
 
         // Auto-sync if buffer has unsent data
@@ -269,11 +320,13 @@ impl<'a> Pipeline<'a> {
             self.sync().await?;
         }
 
+        self.conn.begin_exchange()?;
         if self.aborted {
             self.claim_seq += 1;
             // Pop but don't process the exec expectation (server skipped it)
             self.expectations.pop_front();
             self.consume_pending_syncs().await?;
+            self.conn.finish_exchange();
             return Err(Error::LibraryBug(
                 "pipeline aborted due to earlier error".into(),
             ));
@@ -290,14 +343,14 @@ impl<'a> Pipeline<'a> {
             None => Err(Error::LibraryBug("no expectation in queue".into())),
         };
 
-        if let Err(e) = &result {
-            if e.is_connection_broken() {
-                self.conn.is_broken = true;
-            }
-            self.aborted = true;
+        if result.is_err() && (self.conn.is_broken || !self.aborted) {
+            // Fatal server errors and callback/decoding failures cannot be
+            // recovered by starting a fresh drain of the remaining expectations.
+            return result;
         }
         self.claim_seq += 1;
         self.consume_pending_syncs().await?;
+        self.conn.finish_exchange();
         result
     }
 
@@ -495,8 +548,13 @@ impl<'a> Pipeline<'a> {
 
             // Handle error
             if type_byte == msg_type::ERROR_RESPONSE {
-                let error = ErrorResponse::parse(&self.conn.buffer_set.read_buffer)?;
-                return Err(error.into_error());
+                let error = ErrorResponse::parse(&self.conn.buffer_set.read_buffer)?.into_error();
+                if error.is_connection_broken() {
+                    self.conn.is_broken = true;
+                } else {
+                    self.aborted = true;
+                }
+                return Err(error);
             }
 
             return Ok(());

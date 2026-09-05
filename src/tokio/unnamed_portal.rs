@@ -8,7 +8,7 @@ use super::Conn;
 
 /// Handle to an unnamed portal for async iterative row fetching.
 ///
-/// Created by [`Conn::exec_iter()`]. Use [`exec()`](Self::exec) to retrieve rows in batches.
+/// Created by [`Conn::exec_portal()`]. Use [`exec()`](Self::exec) to retrieve rows in batches.
 pub struct UnnamedPortal<'a> {
     pub(crate) conn: &'a mut Conn,
 }
@@ -23,7 +23,9 @@ impl<'a> UnnamedPortal<'a> {
         max_rows: u32,
         handler: &mut H,
     ) -> Result<bool> {
-        self.conn.lowlevel_execute("", max_rows, handler).await
+        self.conn
+            .lowlevel_execute_inner("", max_rows, handler)
+            .await
     }
 
     /// Execute the portal and call a closure for each row.
